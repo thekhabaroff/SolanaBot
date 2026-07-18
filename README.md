@@ -1,4 +1,4 @@
-# SOLANA BOT v0.20
+# Solana Bot
 
 Интерактивный CLI-инструмент для пакетной работы с Solana-кошельками: создание и конвертация ключей, проверка балансов, мультисендер, swap и закрытие пустых токен аккаунтов.
 
@@ -20,13 +20,8 @@ python bot.py
 ```text
 Solana/
 ├── bot.py            # CLI и операции с кошельками
-├── solana_bot/
-│   ├── models.py     # Типы, константы и точные расчёты
-│   ├── rpc.py        # Solana JSON-RPC, fallback и TX statuses
-│   └── jupiter.py    # Jupiter quote/swap client
 ├── config.json       # RPC, Jupiter, токены, retries и резервы
 ├── requirements.txt  # Зафиксированные runtime-зависимости
-├── tests/            # Регрессионные unit-тесты
 ├── phrases.txt       # BIP-39 сид-фразы
 ├── keys.txt          # Приватные ключи
 ├── wallets.txt       # Публичные адреса
@@ -72,7 +67,3 @@ Solana/
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-**Версия:** 0.20
-**Обновлено:** 2026-07-18
-**Автор:** thekhabaroff
