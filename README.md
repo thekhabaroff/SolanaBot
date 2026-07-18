@@ -9,10 +9,8 @@
 - API key Jupiter для swap
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python bot.py
+pip3 install -r requirements.txt
+python3 bot.py
 ```
 
 ## Структура
@@ -38,7 +36,7 @@ Solana/
    Конвертирует сид-фразы в ключи и ключи в адреса. Для фраз доступны:
 
    - стандартный Solana/SLIP-0010 path `m/44'/501'/0'/0'`;
-   - legacy-режим v0.19 `seed[:32]` для восстановления ранее созданных адресов.
+   - legacy-режим `seed[:32]` для восстановления ранее созданных адресов.
 
    Новые ключи добавляются без дубликатов; замена непустого `wallets.txt` требует отдельного подтверждения.
 3. **Balance Checker**
