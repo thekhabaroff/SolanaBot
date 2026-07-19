@@ -2,13 +2,29 @@
 
 import json
 import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit("Solana Bot требует Python 3.11 или новее")
+
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
+import ssl
+import struct
+import urllib.error
+import urllib.request
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Optional, Dict, Tuple
 from decimal import Decimal, InvalidOperation
 import time
 import base58
+import certifi
+import httpx
+import tomllib
 
 from solders.keypair import Keypair
 from solders.system_program import TransferParams, transfer
@@ -19,42 +35,794 @@ from solders.transaction import Transaction, VersionedTransaction
 from solders.instruction import Instruction, AccountMeta
 from mnemonic import Mnemonic
 
-from solana_bot import (
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-    DEFAULT_CONFIRMATION_TIMEOUT_SEC,
-    DEFAULT_DERIVATION_PATH,
-    WRAPPED_SOL_MINT,
-    BlockhashInfo,
-    JupiterSwapClient,
-    RpcError,
-    RpcHelper,
-    TOKEN_PROGRAM_ID,
-    TokenInfo,
-    decimal_to_raw,
-    derive_slip10_ed25519_seed,
-    format_raw_amount,
-)
+# ==================== SHARED MODELS AND UTILITIES ====================
+
+DEFAULT_CONFIRMATION_TIMEOUT_SEC = 60
+DEFAULT_DERIVATION_PATH = "m/44'/501'/0'/0'"
+WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
+
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+TOKEN_2022_PROGRAM_ID = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+SUPPORTED_TOKEN_PROGRAM_IDS = (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID)
+
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+
+
+@dataclass
+class TokenInfo:
+    """Информация о токене."""
+
+    mint: str
+    decimals: int
+    symbol: str
+
+
+@dataclass(frozen=True)
+class MintInfo:
+    """Проверенные on-chain параметры SPL mint-а."""
+
+    mint: str
+    decimals: int
+    program_id: Pubkey
+    data_len: int
+
+
+@dataclass(frozen=True)
+class BlockhashInfo:
+    """Актуальный blockhash и высота, после которой он недействителен."""
+
+    blockhash: str
+    last_valid_block_height: int
+
+
+@dataclass(frozen=True)
+class EmptyTokenAccount:
+    """Пустой токен-аккаунт, который владелец может закрыть."""
+
+    pubkey: str
+    rent_lamports: int
+    program_id: Pubkey
+
+
+@dataclass(frozen=True)
+class SwapTransactionData:
+    """Транзакция Jupiter с границей действия blockhash."""
+
+    transaction_bytes: bytes
+    last_valid_block_height: Optional[int]
+
+
+class RpcError(RuntimeError):
+    """Ошибка транспорта или JSON-RPC."""
+
+
+def raw_to_decimal(amount: int, decimals: int) -> Decimal:
+    """Преобразовать целое количество atomic units в точное UI-значение."""
+    return Decimal(amount) / (Decimal(10) ** decimals)
+
+
+def decimal_to_raw(value: Decimal, decimals: int) -> int:
+    """Преобразовать UI-значение без потери atomic units."""
+    if decimals < 0 or decimals > 255:
+        raise ValueError("decimals должен быть от 0 до 255")
+    if not value.is_finite() or value <= 0:
+        raise ValueError("Сумма должна быть конечным числом больше нуля")
+
+    scaled = value * (Decimal(10) ** decimals)
+    integral = scaled.to_integral_value()
+    if scaled != integral:
+        raise ValueError(f"Для токена допустимо не более {decimals} знаков после запятой")
+    return int(integral)
+
+
+def format_raw_amount(amount: int, decimals: int) -> str:
+    """Форматировать atomic units без float и научной нотации."""
+    text = format(raw_to_decimal(amount, decimals), 'f')
+    return text.rstrip('0').rstrip('.') if '.' in text else text
+
+
+def derive_slip10_ed25519_seed(seed: bytes, path: str = DEFAULT_DERIVATION_PATH) -> bytes:
+    """Вывести 32-byte Ed25519 seed по hardened SLIP-0010 path."""
+    if not path.startswith("m/"):
+        raise ValueError("Derivation path должен начинаться с m/")
+
+    digest = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
+    key, chain_code = digest[:32], digest[32:]
+
+    for component in path[2:].split('/'):
+        if not component.endswith("'"):
+            raise ValueError("Ed25519 поддерживает только hardened path components")
+        try:
+            index = int(component[:-1])
+        except ValueError as exc:
+            raise ValueError("Некорректный derivation path") from exc
+        if index < 0 or index >= 2**31:
+            raise ValueError("Индекс derivation path вне диапазона")
+        data = b'\x00' + key + (index + 2**31).to_bytes(4, 'big')
+        digest = hmac.new(chain_code, data, hashlib.sha512).digest()
+        key, chain_code = digest[:32], digest[32:]
+
+    return key
+
+
+# ==================== SOLANA RPC ====================
+
+class RpcHelper:
+    """Синхронный Solana JSON-RPC с fallback и TX status tracking."""
+
+    def __init__(self, rpc_urls: Any, max_retries: int = 3):
+        if isinstance(rpc_urls, str):
+            rpc_urls = [rpc_urls]
+        self.rpc_urls = list(dict.fromkeys(url for url in rpc_urls if url))
+        if not self.rpc_urls:
+            raise ValueError("Не указан RPC endpoint")
+        self.rpc_url = self.rpc_urls[0]
+        self.max_retries = max(1, int(max_retries))
+        self.last_error: Optional[Exception] = None
+        self.last_error_was_transport = False
+
+    def _request(
+        self,
+        method: str,
+        params: list,
+        timeout: float = 10,
+        *,
+        retry_rpc_errors: bool = True,
+    ) -> Any:
+        """Выполнить JSON-RPC с transport retry и fallback на резервные endpoints."""
+        self.last_error = None
+        self.last_error_was_transport = False
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }).encode('utf-8')
+
+        for endpoint in self.rpc_urls:
+            for _ in range(self.max_retries):
+                try:
+                    request = urllib.request.Request(
+                        endpoint,
+                        data=payload,
+                        headers={'Content-Type': 'application/json'},
+                    )
+                    with urllib.request.urlopen(
+                        request,
+                        timeout=timeout,
+                        context=SSL_CONTEXT,
+                    ) as response:
+                        body = json.loads(response.read().decode('utf-8'))
+
+                    if 'error' in body:
+                        error = body['error']
+                        message = (
+                            error.get('message', str(error))
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
+                        if isinstance(error, dict) and error.get('data') is not None:
+                            details = json.dumps(error['data'], ensure_ascii=False)
+                            message = f"{message}: {details[:500]}"
+                        self.last_error = RpcError(f"{method}: {message}")
+                        self.last_error_was_transport = False
+                        if retry_rpc_errors:
+                            break
+                        raise self.last_error
+                    if 'result' not in body:
+                        raise RpcError(f"{method}: RPC не вернул result")
+                    self.last_error = None
+                    self.last_error_was_transport = False
+                    return body['result']
+                except RpcError:
+                    if not retry_rpc_errors:
+                        raise
+                    break
+                except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                    self.last_error = exc
+                    self.last_error_was_transport = True
+
+        if self.last_error is None:
+            self.last_error = RpcError(f"{method}: все RPC endpoints недоступны")
+        raise RpcError(str(self.last_error))
+
+    def get_balance_lamports(self, address: str) -> Optional[int]:
+        """Получить баланс SOL в lamports."""
+        try:
+            result = self._request("getBalance", [address, {"commitment": "confirmed"}])
+            return int(result['value'])
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_balance(self, address: str) -> Optional[Decimal]:
+        """Получить точный баланс SOL для отображения."""
+        lamports = self.get_balance_lamports(address)
+        return raw_to_decimal(lamports, 9) if lamports is not None else None
+
+    def account_exists(self, address: str) -> Optional[bool]:
+        """Проверить существование аккаунта без изменения состояния сети."""
+        try:
+            result = self._request(
+                "getAccountInfo",
+                [address, {"commitment": "confirmed", "encoding": "base64"}],
+            )
+            return result.get('value') is not None
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_account_info(self, address: str) -> Optional[dict]:
+        """Вернуть on-chain account info или ``None``, если аккаунт не создан.
+
+        Ошибку RPC можно отличить по ``last_error``. Метод нужен перед
+        подписью: не каждый system-owned account является обычным кошельком.
+        """
+        try:
+            result = self._request(
+                "getAccountInfo",
+                [address, {"commitment": "confirmed", "encoding": "base64"}],
+            )
+            return result.get('value')
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_account_lamports(self, address: str) -> Optional[int]:
+        """Получить лампорты, закреплённые за существующим аккаунтом."""
+        try:
+            result = self._request(
+                "getAccountInfo",
+                [address, {"commitment": "confirmed", "encoding": "base64"}],
+            )
+            value = result.get('value')
+            return int(value['lamports']) if value is not None else None
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_minimum_balance_for_rent_exemption(self, data_len: int) -> Optional[int]:
+        """Получить текущую rent-exempt сумму для аккаунта заданного размера."""
+        try:
+            return int(self._request("getMinimumBalanceForRentExemption", [data_len]))
+        except (RpcError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_token_account_rent_exemption(self) -> Optional[int]:
+        """Получить текущую rent-exempt сумму для стандартного SPL token account."""
+        return self.get_minimum_balance_for_rent_exemption(165)
+
+    @staticmethod
+    def _associated_token_address(owner: str, mint: str, token_program: Pubkey) -> Pubkey:
+        return Pubkey.find_program_address(
+            [bytes(Pubkey.from_string(owner)), bytes(token_program), bytes(Pubkey.from_string(mint))],
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+        )[0]
+
+    def get_token_balance(self, address: str, mint: str) -> Optional[dict]:
+        """Получить суммарный и доступный Jupiter ATA-баланс токена."""
+        try:
+            mint_info = self.get_mint_info(mint)
+            if mint_info is None:
+                return None
+            result = self._request(
+                "getTokenAccountsByOwner",
+                [
+                    address,
+                    {"programId": str(mint_info.program_id)},
+                    {"encoding": "jsonParsed", "commitment": "confirmed"},
+                ],
+            )
+            accounts = [
+                account for account in result.get('value', [])
+                if account['account']['data']['parsed']['info'].get('mint') == mint
+            ]
+            if not accounts:
+                return None
+
+            total_amount = 0
+            spendable_amount = 0
+            associated_addresses = {
+                str(self._associated_token_address(address, mint, mint_info.program_id))
+            }
+
+            for account in accounts:
+                token_amount = account['account']['data']['parsed']['info']['tokenAmount']
+                account_decimals = int(token_amount['decimals'])
+                if account_decimals != mint_info.decimals:
+                    raise RpcError("У token accounts разное значение decimals")
+                raw_amount = int(token_amount['amount'])
+                total_amount += raw_amount
+                if account['pubkey'] in associated_addresses:
+                    spendable_amount += raw_amount
+
+            return {
+                'amount': total_amount,
+                'spendableAmount': spendable_amount,
+                'auxiliaryAmount': total_amount - spendable_amount,
+                'decimals': mint_info.decimals,
+                'programId': mint_info.program_id,
+                'uiAmount': raw_to_decimal(total_amount, mint_info.decimals),
+                'spendableUiAmount': raw_to_decimal(spendable_amount, mint_info.decimals),
+                'accountCount': len(accounts),
+            }
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_mint_info(self, mint: str) -> Optional[MintInfo]:
+        """Получить decimals и token program из on-chain mint account.
+
+        Бинарный Mint layout хранит decimals в байте 44. Проверка owner не
+        позволяет собрать legacy-инструкцию для Token-2022 mint-а и наоборот.
+        """
+        try:
+            result = self._request(
+                "getAccountInfo",
+                [mint, {"commitment": "confirmed", "encoding": "base64"}],
+            )
+            value = result.get('value')
+            if value is None:
+                raise RpcError("Mint не существует в сети")
+            program_id = Pubkey.from_string(value['owner'])
+            if program_id not in SUPPORTED_TOKEN_PROGRAM_IDS:
+                raise RpcError("Mint не принадлежит SPL Token или Token-2022 program")
+            encoded_data = value['data'][0]
+            raw_data = base64.b64decode(encoded_data, validate=True)
+            if len(raw_data) < 82:
+                raise RpcError("Слишком короткий Mint account layout")
+            return MintInfo(
+                mint=mint,
+                decimals=raw_data[44],
+                program_id=program_id,
+                data_len=len(raw_data),
+            )
+        except (RpcError, KeyError, TypeError, ValueError, IndexError, binascii.Error) as exc:
+            self.last_error = exc
+            return None
+
+    def get_token_decimals(self, mint: str) -> Optional[int]:
+        """Получить decimals минта из on-chain данных."""
+        mint_info = self.get_mint_info(mint)
+        return mint_info.decimals if mint_info else None
+
+    def get_latest_blockhash(self) -> Optional[BlockhashInfo]:
+        """Получить blockhash вместе с границей его действия."""
+        try:
+            result = self._request("getLatestBlockhash", [{"commitment": "confirmed"}])
+            value = result['value']
+            return BlockhashInfo(
+                blockhash=value['blockhash'],
+                last_valid_block_height=int(value['lastValidBlockHeight']),
+            )
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_recent_blockhash(self) -> Optional[str]:
+        """Обратно совместимый alias."""
+        info = self.get_latest_blockhash()
+        return info.blockhash if info else None
+
+    def get_block_height(self) -> Optional[int]:
+        """Получить текущую confirmed block height."""
+        try:
+            return int(self._request("getBlockHeight", [{"commitment": "confirmed"}]))
+        except (RpcError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def get_fee_for_message(self, message: Any) -> Optional[int]:
+        """Получить точную комиссию для готового legacy- или versioned-message."""
+        try:
+            encoded = base64.b64encode(bytes(message)).decode('ascii')
+            result = self._request(
+                "getFeeForMessage",
+                [encoded, {"commitment": "confirmed"}],
+            )
+            value = result.get('value')
+            return int(value) if value is not None else None
+        except (RpcError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def send_transaction(self, tx_bytes: bytes) -> Optional[str]:
+        """Отправить точно эти подписанные байты с preflight-проверкой."""
+        tx_encoded = base64.b64encode(tx_bytes).decode('ascii')
+        try:
+            return str(self._request(
+                "sendTransaction",
+                [tx_encoded, {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": self.max_retries,
+                }],
+                timeout=30,
+                retry_rpc_errors=False,
+            ))
+        except RpcError as exc:
+            self.last_error = exc
+            print(f"   ❌ RPC ошибка: {str(exc)[:160]}")
+            return None
+
+    def simulate_signed_transaction(self, tx_bytes: bytes) -> Optional[dict]:
+        """Симулировать уже подписанную транзакцию без её публикации в сеть."""
+        tx_encoded = base64.b64encode(tx_bytes).decode('ascii')
+        try:
+            result = self._request(
+                "simulateTransaction",
+                [tx_encoded, {
+                    "encoding": "base64",
+                    "sigVerify": True,
+                    "replaceRecentBlockhash": False,
+                    "commitment": "confirmed",
+                }],
+                timeout=30,
+                retry_rpc_errors=False,
+            )
+            value = result.get('value')
+            if not isinstance(value, dict):
+                raise RpcError("simulateTransaction не вернул value")
+            return value
+        except (RpcError, KeyError, TypeError, ValueError) as exc:
+            self.last_error = exc
+            return None
+
+    def send_close_account_tx(self, tx_bytes: bytes) -> Optional[str]:
+        """Обратно совместимый alias для CloseAccount."""
+        return self.send_transaction(tx_bytes)
+
+    def get_signature_status(self, signature: str) -> Optional[dict]:
+        """Получить статус, включая историю транзакций."""
+        try:
+            result = self._request(
+                "getSignatureStatuses",
+                [[signature], {"searchTransactionHistory": True}],
+            )
+            values = result.get('value', [])
+            return values[0] if values else None
+        except (RpcError, KeyError, TypeError) as exc:
+            self.last_error = exc
+            return None
+
+    @staticmethod
+    def confirmation_state(status: Optional[dict]) -> str:
+        """Преобразовать RPC status в pending/confirmed/failed."""
+        if status is None:
+            return 'pending'
+        if status.get('err') is not None:
+            return 'failed'
+        if status.get('confirmationStatus') in {'confirmed', 'finalized'}:
+            return 'confirmed'
+        return 'pending'
+
+    def wait_for_confirmation_sync(
+        self,
+        signature: str,
+        timeout: int = DEFAULT_CONFIRMATION_TIMEOUT_SEC,
+        last_valid_block_height: Optional[int] = None,
+    ) -> str:
+        """Ждать confirmed/finalized, ошибку, истечение blockhash или deadline."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = self.get_signature_status(signature)
+            state = self.confirmation_state(status)
+            if state != 'pending':
+                return state
+
+            if last_valid_block_height is not None:
+                block_height = self.get_block_height()
+                if block_height is not None and block_height > last_valid_block_height:
+                    return 'expired'
+            time.sleep(1)
+        return 'pending'
+
+    def get_all_token_accounts(self, owner: str) -> List[dict]:
+        """Получить legacy SPL Token и Token-2022 аккаунты."""
+        accounts: List[dict] = []
+        errors: List[Exception] = []
+        for program_id in SUPPORTED_TOKEN_PROGRAM_IDS:
+            try:
+                result = self._request(
+                    "getTokenAccountsByOwner",
+                    [
+                        owner,
+                        {"programId": str(program_id)},
+                        {"encoding": "base64", "commitment": "confirmed"},
+                    ],
+                )
+                for account in result.get('value', []):
+                    accounts.append({
+                        'pubkey': account['pubkey'],
+                        'lamports': int(account['account']['lamports']),
+                        'data': account['account']['data'][0],
+                        'program_id': program_id,
+                    })
+            except (RpcError, KeyError, TypeError, ValueError) as exc:
+                errors.append(exc)
+
+        if len(errors) == len(SUPPORTED_TOKEN_PROGRAM_IDS):
+            raise RpcError(f"Не удалось получить token accounts: {errors[-1]}")
+        if errors:
+            print("   ⚠️  Часть token programs недоступна; сканирование неполное")
+        return accounts
+
+    def get_empty_token_accounts(self, owner: str) -> Tuple[List[EmptyTokenAccount], int, int, int]:
+        """Найти пустые аккаунты, которые owner имеет право закрыть."""
+        accounts = self.get_all_token_accounts(owner)
+        closable: List[EmptyTokenAccount] = []
+        empty_count = 0
+        skipped_count = 0
+        owner_bytes = bytes(Pubkey.from_string(owner))
+
+        for account in accounts:
+            try:
+                account_data = base64.b64decode(account['data'], validate=True)
+                if len(account_data) < 165:
+                    raise ValueError("Слишком короткий token account layout")
+                token_amount = struct.unpack('<Q', account_data[64:72])[0]
+                if token_amount != 0:
+                    continue
+
+                empty_count += 1
+                account_owner = account_data[32:64]
+                close_option = struct.unpack('<I', account_data[129:133])[0]
+                close_authority = account_data[133:165]
+                can_close = account_owner == owner_bytes and (
+                    close_option == 0 or (close_option == 1 and close_authority == owner_bytes)
+                )
+                if not can_close:
+                    skipped_count += 1
+                    continue
+
+                closable.append(EmptyTokenAccount(
+                    pubkey=account['pubkey'],
+                    rent_lamports=account['lamports'],
+                    program_id=account['program_id'],
+                ))
+            except (ValueError, TypeError, KeyError, struct.error):
+                skipped_count += 1
+
+        return closable, len(accounts), empty_count, skipped_count
+
+
+# ==================== JUPITER CLIENT ====================
+
+class JupiterSwapClient:
+    """Async-клиент Jupiter Metis Swap API v1."""
+
+    def __init__(
+        self,
+        api_url: str,
+        api_key: Optional[str] = None,
+        priority_level: str = "none",
+        max_priority_lamports: int = 0,
+    ):
+        self.api_url = api_url.rstrip('/')
+        self.api_key = api_key
+        self.priority_level = priority_level
+        self.max_priority_lamports = max_priority_lamports
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def get_priority_fee_payload(self) -> Any:
+        """Сформировать prioritizationFeeLamports по API Jupiter."""
+        if self.priority_level == "auto":
+            return "auto"
+        if self.priority_level == "none" or self.max_priority_lamports == 0:
+            return 0
+        if self.priority_level not in {"medium", "high", "veryHigh"}:
+            raise ValueError(f"Неподдерживаемый priority_level: {self.priority_level}")
+        return {
+            "priorityLevelWithMaxLamports": {
+                "priorityLevel": self.priority_level,
+                "maxLamports": int(self.max_priority_lamports),
+            }
+        }
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Получить или создать HTTP-клиент."""
+        if self._client is None:
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            }
+            if self.api_key:
+                headers['x-api-key'] = self.api_key
+            self._client = httpx.AsyncClient(
+                timeout=30.0,
+                headers=headers,
+                verify=SSL_CONTEXT,
+            )
+        return self._client
+
+    async def close(self):
+        """Закрыть HTTP-клиент."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def get_quote(
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount: int,
+        slippage_bps: int,
+    ) -> Optional[dict]:
+        """Получить и проверить ExactIn-котировку."""
+        client = await self._get_client()
+        url = f"{self.api_url}/quote"
+        params = {
+            'inputMint': input_mint,
+            'outputMint': output_mint,
+            'amount': str(amount),
+            'slippageBps': slippage_bps,
+            'swapMode': 'ExactIn',
+            'instructionVersion': 'V2',
+        }
+
+        print(f"   🔗 URL: {url}")
+        print(f"   📤 {input_mint[:20]}... → {output_mint[:20]}...")
+        print(f"   💰 Amount: {amount} | Slippage: {slippage_bps} bps")
+
+        for attempt in range(3):
+            try:
+                response = await client.get(url, params=params)
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'error' in result or 'errorCode' in result:
+                        error_msg = result.get('error', result.get('errorCode', 'Unknown'))
+                        print(f"   ❌ Jupiter: {error_msg}")
+                        return None
+                    try:
+                        valid_quote = (
+                            result.get('inputMint') == input_mint
+                            and result.get('outputMint') == output_mint
+                            and int(result.get('inAmount', 0)) == amount
+                            and int(result.get('outAmount', 0)) > 0
+                        )
+                    except (TypeError, ValueError):
+                        valid_quote = False
+                    if not valid_quote:
+                        print("   ❌ Jupiter вернул котировку с неожиданными параметрами")
+                        return None
+                    print("   ✅ Котировка получена!")
+                    return result
+                if response.status_code == 400:
+                    try:
+                        error_data = response.json()
+                        print(f"   ❌ Ошибка 400: {error_data.get('error', error_data)}")
+                    except (ValueError, TypeError):
+                        print(f"   ❌ Ошибка 400: {response.text[:100]}")
+                    return None
+                if response.status_code == 401:
+                    print("   ❌ Ошибка 401: Неверный API key")
+                    return None
+                if response.status_code == 404:
+                    print("   ❌ Ошибка 404: Route not found")
+                    print("   💡 Проверьте адрес токенов")
+                    return None
+                if response.status_code == 429:
+                    print("   ⏳ Rate limit, ждём 2 сек...")
+                    await asyncio.sleep(2)
+                    continue
+                if response.status_code in [500, 502, 503] and attempt < 2:
+                    print("   ⏳ Сервер недоступен, повтор...")
+                    await asyncio.sleep(1)
+                    continue
+                print(f"   ❌ HTTP {response.status_code}")
+                return None
+            except httpx.TimeoutException:
+                if attempt < 2:
+                    print("   ⏳ Timeout, повтор...")
+                    await asyncio.sleep(1)
+                    continue
+                print(f"   ❌ Timeout после {attempt + 1} попыток")
+                return None
+            except Exception as exc:
+                print(f"   ❌ Ошибка: {str(exc)[:60]}")
+                return None
+        return None
+
+    async def get_swap_transaction(
+        self,
+        quote: dict,
+        user_pubkey: str,
+    ) -> Optional[SwapTransactionData]:
+        """Получить и проверить сериализованную swap-транзакцию."""
+        client = await self._get_client()
+        url = f"{self.api_url}/swap"
+        try:
+            priority_fee = self.get_priority_fee_payload()
+        except ValueError as exc:
+            print(f"   ❌ {exc}")
+            return None
+        payload = {
+            "quoteResponse": quote,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": priority_fee,
+        }
+        if isinstance(priority_fee, int) and priority_fee > 0:
+            print(f"   💸 Priority Fee: {priority_fee} lamports")
+
+        for attempt in range(3):
+            try:
+                response = await client.post(url, json=payload)
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'error' in result:
+                        print(f"   ❌ Jupiter: {result['error']}")
+                        return None
+                    if 'swapTransaction' in result:
+                        try:
+                            transaction_bytes = base64.b64decode(
+                                result['swapTransaction'], validate=True,
+                            )
+                            if not transaction_bytes:
+                                raise ValueError("пустая транзакция")
+                            last_valid = result.get('lastValidBlockHeight')
+                            return SwapTransactionData(
+                                transaction_bytes=transaction_bytes,
+                                last_valid_block_height=(
+                                    int(last_valid) if last_valid is not None else None
+                                ),
+                            )
+                        except (ValueError, TypeError):
+                            print("   ❌ Jupiter вернул некорректную swapTransaction")
+                            return None
+                    print("   ❌ Нет swapTransaction в ответе")
+                    return None
+                if response.status_code == 400:
+                    error_text = response.text[:200] if response.text else "Unknown"
+                    print(f"   ❌ Ошибка 400: {error_text}")
+                    return None
+                if response.status_code == 401:
+                    print("   ❌ Ошибка 401: Проблема с API key")
+                    return None
+                if response.status_code == 429:
+                    print("   ⏳ Rate limit, ждём...")
+                    await asyncio.sleep(2)
+                    continue
+                if response.status_code in [500, 502, 503] and attempt < 2:
+                    await asyncio.sleep(1)
+                    continue
+                print(f"   ❌ HTTP {response.status_code}")
+                return None
+            except httpx.TimeoutException:
+                if attempt < 2:
+                    await asyncio.sleep(1)
+                    continue
+                print("   ❌ Timeout")
+                return None
+            except Exception as exc:
+                print(f"   ❌ Ошибка: {str(exc)[:60]}")
+                return None
+        return None
 
 # ==================== CONFIG MANAGER ====================
 
 class ConfigManager:
     """Управление конфигурацией приложения"""
     
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = "config.toml"):
         self.config_path = config_path
         self.config = self.load_config()
     
     def load_config(self) -> dict:
-        """Загрузить конфиг из JSON файла"""
+        """Загрузить конфиг из TOML файла."""
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            with open(self.config_path, 'rb') as f:
+                config = tomllib.load(f)
         except FileNotFoundError as exc:
             raise RuntimeError(f"Файл {self.config_path} не найден") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Некорректный JSON в {self.config_path}: {exc}") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise RuntimeError(f"Некорректный TOML в {self.config_path}: {exc}") from exc
         if not isinstance(config, dict):
-            raise RuntimeError("Корневое значение config.json должно быть объектом")
+            raise RuntimeError("Корневое значение config.toml должно быть таблицей")
         return config
     
     def get_rpc_endpoint(self) -> str:
@@ -176,7 +944,7 @@ class FileManager:
         }
         configured_files = config.get('files', {})
         if not isinstance(configured_files, dict):
-            raise ValueError("files в config.json должен быть объектом")
+            raise ValueError("files в config.toml должен быть таблицей")
         self.config = {**default_files, **configured_files}
         if not all(isinstance(path, str) and path for path in self.config.values()):
             raise ValueError("Все пути в files должны быть непустыми строками")
@@ -341,6 +1109,33 @@ class WalletManager:
             )
         return Message([instruction], payer=sender.pubkey())
 
+    def _is_regular_fee_payer(self, address: str, *, action: str) -> bool:
+        """Проверить, что ключ можно использовать как обычный fee payer.
+
+        System-owned nonce accounts тоже имеют SOL-баланс, но содержат данные.
+        Их нельзя передавать в SystemProgram.transfer и использовать для
+        стандартных Jupiter/SPL транзакций. Ранняя проверка предотвращает
+        неясный ``InvalidArgument`` уже после подтверждения пользователя.
+        """
+        self.rpc.last_error = None
+        info = self.rpc.get_account_info(address)
+        if info is None:
+            if self.rpc.last_error is not None:
+                print(f"❌ Не удалось проверить аккаунт для {action}")
+            else:
+                print(f"❌ Аккаунт для {action} не существует в сети")
+            return False
+        owner = info.get('owner')
+        space = info.get('space')
+        if owner != str(self.SYSTEM_PROGRAM_ID) or space != 0:
+            print(
+                f"❌ Аккаунт для {action} не является обычным SOL-кошельком "
+                f"(owner: {str(owner)[:12]}…, data: {space} bytes)."
+            )
+            print("   Нужен обычный system account без данных; nonce/stake/program accounts не поддерживаются этой операцией.")
+            return False
+        return True
+
     def _submit_and_confirm(
         self,
         transaction: Transaction,
@@ -357,9 +1152,26 @@ class WalletManager:
         transaction: Any,
         last_valid_block_height: Optional[int],
     ) -> Tuple[str, Optional[str]]:
-        """Общий submit/confirm для legacy и versioned transactions."""
+        """Симулировать, отправить и подтвердить legacy/versioned transaction.
+
+        Симуляция не является пользовательским dry-run: она автоматически
+        проверяет ровно те подписанные байты, которые будут отправлены далее.
+        При ошибке ничего не публикуется в сеть.
+        """
+        transaction_bytes = bytes(transaction)
         local_signature = str(transaction.signatures[0])
-        signature = self.rpc.send_transaction(bytes(transaction))
+        simulation = self.rpc.simulate_signed_transaction(transaction_bytes)
+        if simulation is None:
+            print("   ❌ Не удалось выполнить preflight-симуляцию; отправка отменена")
+            return 'failed', None
+        if simulation.get('err') is not None:
+            print(f"   ❌ Симуляция не пройдена: {simulation['err']}")
+            logs = simulation.get('logs') or []
+            for log in logs[-3:]:
+                print(f"      {str(log)[:180]}")
+            return 'failed', None
+
+        signature = self.rpc.send_transaction(transaction_bytes)
         if signature is None:
             if not self.rpc.last_error_was_transport:
                 return 'failed', None
@@ -559,8 +1371,8 @@ class WalletManager:
         
         print("\nВыберите какие токены проверять:")
         print("1. Только SOL")
-        print("2. SOL + популярные SPL токены")
-        print("3. Конкретный SPL токен (mint адрес)")
+        print("2. SOL + популярные токены")
+        print("3. Конкретный токен")
         
         token_choice = input("\nВыбор (1-3): ").strip()
         
@@ -574,12 +1386,12 @@ class WalletManager:
                 if symbol != 'SOL':
                     tokens_to_check[symbol] = token_info.get('mint')
         elif token_choice == '3':
-            token_mint = input("Введите mint адрес токена: ").strip()
+            token_mint = input("Введите адрес токена: ").strip()
             token_name = input("Введите название токена: ").strip()
             try:
                 Pubkey.from_string(token_mint)
             except Exception:
-                print("❌ Некорректный mint адрес!")
+                print("❌ Некорректный адрес!")
                 return
             if not token_name:
                 print("❌ Название токена не может быть пустым!")
@@ -674,14 +1486,15 @@ class WalletManager:
         amount: int,
         blockhash: str,
         recipient_ata_exists: bool,
+        mint_info: MintInfo,
     ) -> Message:
-        """Собрать USDC transferChecked и при необходимости создать ATA получателя."""
-        mint = Pubkey.from_string(self.config_mgr.get_all_tokens()['USDC']['mint'])
+        """Собрать transferChecked и при необходимости создать ATA получателя."""
+        mint = Pubkey.from_string(mint_info.mint)
         sender_ata = self.rpc._associated_token_address(
-            str(sender.pubkey()), str(mint), TOKEN_PROGRAM_ID,
+            str(sender.pubkey()), str(mint), mint_info.program_id,
         )
         recipient_ata = self.rpc._associated_token_address(
-            str(recipient), str(mint), TOKEN_PROGRAM_ID,
+            str(recipient), str(mint), mint_info.program_id,
         )
         instructions = []
         if not recipient_ata_exists:
@@ -693,19 +1506,19 @@ class WalletManager:
                     AccountMeta(recipient, False, False),
                     AccountMeta(mint, False, False),
                     AccountMeta(self.SYSTEM_PROGRAM_ID, False, False),
-                    AccountMeta(TOKEN_PROGRAM_ID, False, False),
+                    AccountMeta(mint_info.program_id, False, False),
                 ],
                 data=bytes([1]),  # CreateIdempotent
             ))
         instructions.append(Instruction(
-            program_id=TOKEN_PROGRAM_ID,
+            program_id=mint_info.program_id,
             accounts=[
                 AccountMeta(sender_ata, False, True),
                 AccountMeta(mint, False, False),
                 AccountMeta(recipient_ata, False, True),
                 AccountMeta(sender.pubkey(), True, False),
             ],
-            data=bytes([12]) + amount.to_bytes(8, 'little') + bytes([6]),
+            data=bytes([12]) + amount.to_bytes(8, 'little') + bytes([mint_info.decimals]),
         ))
         return Message.new_with_blockhash(
             instructions, sender.pubkey(), Hash.from_string(blockhash),
@@ -726,6 +1539,8 @@ class WalletManager:
             return
 
         sender_address = str(sender.pubkey())
+        if not self._is_regular_fee_payer(sender_address, action="USDC-отправки"):
+            return
         addresses, invalid = self._validate_pubkeys(addresses)
         if invalid:
             print(f"⚠️ Пропущено некорректных адресов: {len(invalid)}")
@@ -735,12 +1550,32 @@ class WalletManager:
             print("❌ Нет получателей!")
             return
         try:
-            amount = decimal_to_raw(Decimal(input("Сумма USDC для каждого адреса: ").strip()), 6)
+            usdc = self.config_mgr.get_all_tokens()['USDC']
+            mint_info = self.rpc.get_mint_info(usdc['mint'])
+        except KeyError:
+            print("❌ USDC не настроен в config.toml!")
+            return
+        if mint_info is None:
+            print("❌ Не удалось проверить USDC mint в сети")
+            return
+        if mint_info.program_id == TOKEN_2022_PROGRAM_ID and mint_info.data_len > 82:
+            print("❌ USDC mint с Token-2022 extensions пока не поддержан прямой отправкой")
+            return
+        configured_decimals = usdc.get('decimals')
+        if configured_decimals != mint_info.decimals:
+            print(
+                f"⚠️  USDC decimals исправлено {configured_decimals} → "
+                f"{mint_info.decimals} по on-chain данным"
+            )
+        try:
+            amount = decimal_to_raw(
+                Decimal(input("Сумма USDC для каждого адреса: ").strip()),
+                mint_info.decimals,
+            )
         except (InvalidOperation, ValueError):
             print("❌ Неверная сумма USDC!")
             return
 
-        usdc = self.config_mgr.get_all_tokens()['USDC']
         token_balance = self.rpc.get_token_balance(sender_address, usdc['mint'])
         if not token_balance or token_balance['spendableAmount'] < amount * len(addresses):
             print("❌ Недостаточно USDC на associated token account!")
@@ -753,7 +1588,9 @@ class WalletManager:
 
         recipient_state = []
         for address in addresses:
-            ata = self.rpc._associated_token_address(address, usdc['mint'], TOKEN_PROGRAM_ID)
+            ata = self.rpc._associated_token_address(
+                address, usdc['mint'], mint_info.program_id,
+            )
             exists = self.rpc.account_exists(str(ata))
             if exists is None:
                 print("❌ Не удалось проверить token account получателя")
@@ -766,7 +1603,7 @@ class WalletManager:
         first_address, first_ata_exists = recipient_state[0]
         preview = self._build_usdc_transfer_message(
             sender, Pubkey.from_string(first_address), amount,
-            blockhash_info.blockhash, first_ata_exists,
+            blockhash_info.blockhash, first_ata_exists, mint_info,
         )
         fee = self.rpc.get_fee_for_message(preview)
         if fee is None:
@@ -779,7 +1616,10 @@ class WalletManager:
         if sol_balance is None or sol_balance < required_sol:
             print("❌ Недостаточно SOL на комиссии и создание USDC-аккаунтов!")
             return
-        print(f"\n📤 USDC: по {format_raw_amount(amount, 6)} на {len(addresses)} адресов")
+        print(
+            f"\n📤 USDC: по {format_raw_amount(amount, mint_info.decimals)} "
+            f"на {len(addresses)} адресов"
+        )
         print(f"⚙️ Комиссии: {format_raw_amount(total_fee, 9)} SOL")
         print(f"🏦 Rent новых ATA: {format_raw_amount(total_rent, 9)} SOL")
         print(f"🛡️ Минимальный остаток SOL отправителя: {format_raw_amount(sender_system_rent, 9)} SOL")
@@ -796,7 +1636,8 @@ class WalletManager:
                 counts['failed'] += 1
                 continue
             message = self._build_usdc_transfer_message(
-                sender, Pubkey.from_string(address), amount, info.blockhash, ata_exists,
+                sender, Pubkey.from_string(address), amount, info.blockhash,
+                ata_exists, mint_info,
             )
             tx = Transaction([sender], message, Hash.from_string(info.blockhash))
             state, signature = self._submit_and_confirm(tx, info)
@@ -835,6 +1676,8 @@ class WalletManager:
             sender_address = str(sender_kp.pubkey())
         except Exception as e:
             print(f"❌ Ошибка восстановления ключа: {str(e)[:50]}")
+            return
+        if not self._is_regular_fee_payer(sender_address, action="SOL-отправки"):
             return
 
         original_count = len(addresses)
@@ -1023,6 +1866,8 @@ class WalletManager:
 
         for i, (address, keypair) in enumerate(senders.items(), 1):
             try:
+                if not self._is_regular_fee_payer(address, action="SOL-отправки"):
+                    continue
                 balance = self.rpc.get_balance_lamports(address)
                 if balance is None:
                     print(f"❌ {i}. {address[:20]}... → ошибка RPC")
@@ -1118,7 +1963,7 @@ class WalletManager:
         # Получаем токены из конфига
         tokens = self.config_mgr.get_all_tokens()
         if not tokens:
-            print("❌ Токены не настроены в config.json!")
+            print("❌ Токены не настроены в config.toml!")
             return
         
         # Показываем доступные токены
@@ -1126,7 +1971,7 @@ class WalletManager:
         token_list = list(tokens.items())
         for i, (symbol, info) in enumerate(token_list, 1):
             print(f"  {i}. {symbol} ({info['mint'][:20]}...)")
-        print("  0. Ввести mint адрес вручную")
+        print("  0. Ввести адрес вручную")
         
         # Выбор входящего токена
         print("\n📥 Выберите ВХОДЯЩИЙ токен (что отдаём):")
@@ -1134,7 +1979,7 @@ class WalletManager:
             input_choice = input("Номер или символ: ").strip()
             
             if input_choice == '0':
-                input_mint = input("   Mint адрес: ").strip()
+                input_mint = input("   Адрес токена: ").strip()
                 input_symbol = input("   Символ токена: ").strip().upper()
                 input_decimals = int(input("   Decimals (0-255): ").strip() or "6")
                 input_token = TokenInfo(mint=input_mint, decimals=input_decimals, symbol=input_symbol)
@@ -1171,13 +2016,13 @@ class WalletManager:
         available = [(s, i) for s, i in token_list if s != input_token.symbol]
         for i, (symbol, _) in enumerate(available, 1):
             print(f"  {i}. {symbol}")
-        print("  0. Ввести mint адрес вручную")
+        print("  0. Ввести адрес вручную")
         
         try:
             output_choice = input("Номер или символ: ").strip()
             
             if output_choice == '0':
-                output_mint = input("   Mint адрес: ").strip()
+                output_mint = input("   Адрес токена: ").strip()
                 output_symbol = input("   Символ токена: ").strip().upper()
                 output_decimals = int(input("   Decimals (0-255): ").strip() or "6")
                 output_token = TokenInfo(mint=output_mint, decimals=output_decimals, symbol=output_symbol)
@@ -1213,7 +2058,7 @@ class WalletManager:
             Pubkey.from_string(input_token.mint)
             Pubkey.from_string(output_token.mint)
         except Exception:
-            print("❌ Некорректный mint адрес!")
+            print("❌ Некорректный адрес токена!")
             return
         if not input_token.symbol or not output_token.symbol:
             print("❌ Символ токена не может быть пустым!")
@@ -1329,7 +2174,7 @@ class WalletManager:
             print(f"      {index}. {address}")
         print("="*50)
         
-        confirm = input("\n⚠️  Начать? (yes/no): ").strip().lower()
+        confirm = input("\n⚠️  Получить котировки? (yes/no): ").strip().lower()
         if confirm != 'yes':
             print("❌ Отменено")
             return
@@ -1357,6 +2202,8 @@ class WalletManager:
                 
                 try:
                     print(f"🔄 Кошелёк: {pubkey[:20]}...{pubkey[-8:]}")
+                    if not self._is_regular_fee_payer(pubkey, action="swap"):
+                        continue
                     
                     # Получаем балансы
                     sol_balance_lamports = self.rpc.get_balance_lamports(pubkey)
@@ -1424,9 +2271,25 @@ class WalletManager:
                     
                     in_amount = int(quote.get("inAmount", 0))
                     out_amount = int(quote.get("outAmount", 0))
+                    try:
+                        minimum_out = int(quote.get("otherAmountThreshold", out_amount))
+                    except (TypeError, ValueError):
+                        print("   ❌ Jupiter вернул некорректный minimum received")
+                        continue
                     
                     print(f"   📥 Отдаём: {format_raw_amount(in_amount, input_token.decimals)} {input_token.symbol}")
                     print(f"   📤 Получаем: {format_raw_amount(out_amount, output_token.decimals)} {output_token.symbol}")
+                    print(
+                        "   🛡️ Минимум после slippage: "
+                        f"{format_raw_amount(minimum_out, output_token.decimals)} "
+                        f"{output_token.symbol}"
+                    )
+                    price_impact = quote.get("priceImpactPct")
+                    if price_impact is not None:
+                        print(f"   📉 Price impact: {price_impact}%")
+                    if input("   ⚠️ Подтвердить этот swap по котировке? (yes/no): ").strip().lower() != 'yes':
+                        print("   • Swap по этой котировке пропущен")
+                        continue
                     
                     # Получаем транзакцию
                     print("📝 Создание транзакции...")
@@ -1583,13 +2446,15 @@ class WalletManager:
                     stats['wallets_with_tokens'] += 1
                     potential_refund_lamports = sum(account.rent_lamports for account in empty_accounts)
                     print(f"    💵 Можно вернуть: ~{format_raw_amount(potential_refund_lamports, 9)} SOL")
-                    
-                    wallets_to_process.append({
-                        'keypair': keypair,
-                        'pubkey': pubkey,
-                        'sol_balance_lamports': sol_balance_lamports,
-                        'empty_accounts': empty_accounts
-                    })
+                    if self._is_regular_fee_payer(pubkey, action="закрытия token accounts"):
+                        wallets_to_process.append({
+                            'keypair': keypair,
+                            'pubkey': pubkey,
+                            'sol_balance_lamports': sol_balance_lamports,
+                            'empty_accounts': empty_accounts
+                        })
+                    else:
+                        print("    ⚠️ Закрытие пропущено: этот ключ нельзя использовать как fee payer")
                     
             except Exception as e:
                 print(f"\n[{i}/{len(keys)}] ❌ Ошибка: {str(e)[:50]}")
