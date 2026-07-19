@@ -1,7 +1,7 @@
 <h1 align="center">Solana Bot</h1>
 
 <p align="center">
-  Интерактивный CLI для пакетной работы с Solana-кошельками: ключи, балансы, переводы, swap через Jupiter и возврат rent из пустых token accounts.
+  Интерактивный CLI для пакетной работы с Solana-кошельками: ключи, балансы, переводы, swap через Jupiter и возврат rent из пустых токен аккаунтов.
 </p>
 
 <div align="center">
@@ -18,9 +18,6 @@
 
 </div>
 
-> [!WARNING]
-> Бот работает с **Solana mainnet**. Подписанные транзакции необратимы. Используйте отдельные кошельки с небольшой суммой, проверяйте получателей и начинайте с тестовой операции.
-
 ## Возможности
 
 - создание независимых Solana keypair и BIP-39 seed-фраз на 12 или 24 слова;
@@ -29,11 +26,11 @@
 - проверка SOL, токенов из конфигурации или одного указанного mint;
 - массовые переводы SOL: «один → много» и «многие → один»;
 - массовая отправка USDC «один → много» с созданием associated token account (ATA) получателя при необходимости;
-- swap токенов через Jupiter: котировка, minimum received, price impact, отдельное подтверждение и preflight-симуляция;
+- swap токенов: котировка, minimum received, price impact, отдельное подтверждение и preflight-симуляция;
 - закрытие пустых SPL token accounts с возвратом rent-exempt SOL;
 - резервные RPC, повтор запросов и ожидание статуса `confirmed` или `finalized`.
 
-Вся прикладная логика, RPC-клиент, Jupiter-клиент и интерфейс находятся в одном файле `bot.py`.
+Вся прикладная логика, RPC-клиент и интерфейс находятся в одном файле `bot.py`.
 
 ## Требования
 
@@ -55,18 +52,9 @@
 git clone https://github.com/thekhabaroff/SolanaBot.git
 cd SolanaBot
 
-python3 -m venv .venv
-source .venv/bin/activate
-
-python -m pip install --upgrade pip
-python -m pip install --upgrade -r requirements.txt
+pip3 install --upgrade pip
+pip3 install --upgrade -r requirements.txt
 python bot.py
-```
-
-В Windows вместо активации выше используйте:
-
-```powershell
-.venv\Scripts\Activate.ps1
 ```
 
 ## Настройка
@@ -96,7 +84,7 @@ jupiter_key = "YOUR_JUPITER_API_KEY"
 | Файл | Назначение |
 | --- | --- |
 | `phrases.txt` | BIP-39 seed-фразы, по одной на строку. |
-| `keys.txt` | Приватные ключи, по одному на строку. Поддерживаются base58, JSON-массив байтов и hex. |
+| `keys.txt`    | Приватные ключи, по одному на строку. Поддерживаются base58, JSON-массив байтов и hex. |
 | `wallets.txt` | Публичные Solana-адреса, по одному на строку. |
 | `history.log` | Локальная история операций и статусов транзакций. |
 | `config.toml` | RPC, параметры операций, токены и Jupiter API key. |
@@ -120,7 +108,7 @@ python bot.py
 4. Multisender       — массовые переводы SOL или USDC
 5. Swap              — обмен через Jupiter
 6. Refund            — закрытие пустых token accounts
-0. Exit
+0. Exit              — выход
 ```
 
 ### Массовые переводы
