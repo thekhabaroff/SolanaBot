@@ -1,0 +1,53 @@
+rpc_url = "https://solana-rpc.publicnode.com"
+rpc_alternatives = ["https://api.mainnet-beta.solana.com"]
+default_slippage_bps = 50
+delay_between_wallets_sec = 2
+max_retries = 3
+confirmation_timeout_sec = 60
+swap_fee_reserve_lamports = 5000000
+
+[api]
+jupiter_api_url = "https://api.jup.ag/swap/v1"
+jupiter_key = "YOUR_API"
+
+[priority_settings]
+priority_level = "none"
+max_lamports = 0
+
+[tokens]
+
+[tokens.SOL]
+mint = "So11111111111111111111111111111111111111112"
+decimals = 9
+symbol = "SOL"
+
+[tokens.USDC]
+mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+decimals = 6
+symbol = "USDC"
+
+[tokens.USDT]
+mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+decimals = 6
+symbol = "USDT"
+
+[tokens.JUP]
+mint = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+decimals = 6
+symbol = "JUP"
+
+[tokens.RAY]
+mint = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
+decimals = 6
+symbol = "RAY"
+
+[tokens.GRASS]
+mint = "Grass7B4RdKfBCjTKgSqnXkqjwiGvQyFbuSCUJr3XXjs"
+decimals = 9
+symbol = "GRASS"
+
+[files]
+phrases = "phrases.txt"
+keys = "keys.txt"
+wallets = "wallets.txt"
+history = "history.log"

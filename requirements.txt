@@ -1,5 +1,5 @@
-solders
-httpx
-mnemonic
-base58
-certifi
+solders==0.28.0
+httpx==0.28.1
+mnemonic==0.21
+base58==2.1.1
+certifi==2026.6.17
