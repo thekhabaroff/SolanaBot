@@ -53,7 +53,7 @@ git clone https://github.com/thekhabaroff/SolanaBot.git
 cd SolanaBot
 
 pip3 install --upgrade pip
-pip3 install --upgrade -r requirements.txt
+pip3 install -r requirements.txt
 python bot.py
 ```
 
